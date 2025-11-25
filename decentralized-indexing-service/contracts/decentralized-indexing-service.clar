@@ -476,3 +476,234 @@
     (ok (get amount reward-info))
   )
 )
+
+;; Create a new governance proposal
+(define-public (create-proposal
+  (description-hash (string-ascii 64))
+  (parameter-key (string-ascii 32))
+  (proposed-value uint)
+)
+  (let (
+    (proposer tx-sender)
+    (current-id (var-get current-proposal-id))
+    (node-info (unwrap! (map-get? IndexingNodes { node-address: proposer }) ERR_INVALID_NODE))
+  )
+    ;; Verify proposer has sufficient reputation
+    (asserts! (>= (get reputation-score node-info) u5000) ERR_INSUFFICIENT_REPUTATION)
+    
+    ;; Create proposal
+    (map-set Proposals
+      { proposal-id: (+ current-id u1) }
+      {
+        proposer: proposer,
+        description-hash: description-hash,
+        parameter-key: parameter-key,
+        proposed-value: proposed-value,
+        start-block: stacks-block-height,
+        end-block: (+ stacks-block-height PROPOSAL_VOTING_PERIOD),
+        votes-for: u0,
+        votes-against: u0,
+        executed: false
+      }
+    )
+    
+    ;; Update proposal counter
+    (var-set current-proposal-id (+ current-id u1))
+    
+    (ok (+ current-id u1))
+  )
+)
+
+;; Execute a passed proposal
+(define-public (execute-proposal
+  (proposal-id uint)
+)
+  (let (
+    (proposal (unwrap! (map-get? Proposals { proposal-id: proposal-id }) ERR_INVALID_QUERY))
+  )
+    ;; Verify proposal voting period has ended
+    (asserts! (> stacks-block-height (get end-block proposal)) ERR_PROPOSAL_NOT_ACTIVE)
+    
+    ;; Verify proposal hasn't been executed
+    (asserts! (not (get executed proposal)) ERR_PROPOSAL_NOT_ACTIVE)
+    
+    ;; Verify proposal passed
+    (asserts! (and
+              (> (get votes-for proposal) (get votes-against proposal))
+              (>= (get votes-for proposal) MIN_VOTES_FOR_PROPOSAL))
+             ERR_INSUFFICIENT_REPUTATION)
+    
+    ;; Update network parameter
+    (map-set NetworkParameters
+      { param-key: (get parameter-key proposal) }
+      { value: (get proposed-value proposal) }
+    )
+    
+    ;; Mark proposal as executed
+    (map-set Proposals
+      { proposal-id: proposal-id }
+      (merge proposal { executed: true })
+    )
+    
+    (ok true)
+  )
+)
+
+;; Subscribe to a data feed
+(define-public (subscribe-to-feed
+  (feed-id (string-ascii 32))
+  (subscription-period uint)
+)
+  (let (
+    (subscriber tx-sender)
+    (feed (unwrap! (map-get? DataFeeds { feed-id: feed-id }) ERR_INVALID_DATA_FEED))
+    (total-fee (* (get access-fee feed) subscription-period))
+  )
+    ;; Verify feed hasn't expired
+    (asserts! (< stacks-block-height (get expiry-block feed)) ERR_INVALID_DATA_FEED)
+    
+    ;; Pay subscription fee to creator
+    (try! (stx-transfer? total-fee subscriber (get creator feed)))
+    
+    ;; Record subscription
+    (map-set FeedSubscriptions
+      {
+        subscriber: subscriber,
+        feed-id: feed-id
+      }
+      {
+        start-block: stacks-block-height,
+        subscription-period: subscription-period,
+        total-paid: total-fee
+      }
+    )
+    
+    ;; Update feed subscriber count
+    (map-set DataFeeds
+      { feed-id: feed-id }
+      (merge feed { subscribers: (+ (get subscribers feed) u1) })
+    )
+    
+    (ok true)
+  )
+)
+
+;; Create a specialized subnet
+(define-public (create-subnet
+  (subnet-id (string-ascii 32))
+  (min-stake-requirement uint)
+  (specialized bool)
+  (topic-hash (string-ascii 64))
+)
+  (let (
+    (creator tx-sender)
+    (node-info (unwrap! (map-get? IndexingNodes { node-address: creator }) ERR_INVALID_NODE))
+  )
+    ;; Verify node is active and has enough reputation
+    (asserts! (and (get active node-info) 
+                  (>= (get reputation-score node-info) u5000))
+             ERR_INSUFFICIENT_REPUTATION)
+    
+    ;; Pay subnet creation fee
+    (try! (stx-transfer? SUBNET_CREATION_FEE creator (as-contract tx-sender)))
+    
+    ;; Create subnet
+    (map-set Subnets
+      { subnet-id: subnet-id }
+      {
+        creator: creator,
+        creation-block: stacks-block-height,
+        node-count: u1, ;; Creator is first member
+        min-stake-requirement: min-stake-requirement,
+        specialized: specialized,
+        topic-hash: topic-hash
+      }
+    )
+    
+    ;; Add creator to subnet
+    (map-set SubnetMembership
+      {
+        subnet-id: subnet-id,
+        node: creator
+      }
+      {
+        join-block: stacks-block-height,
+        stake-committed: (get total-stake node-info)
+      }
+    )
+    
+    (ok true)
+  )
+)
+
+;; Join a subnet
+(define-public (join-subnet
+  (subnet-id (string-ascii 32))
+)
+  (let (
+    (node tx-sender)
+    (node-info (unwrap! (map-get? IndexingNodes { node-address: node }) ERR_INVALID_NODE))
+    (subnet (unwrap! (map-get? Subnets { subnet-id: subnet-id }) ERR_INVALID_QUERY))
+  )
+    ;; Verify node is active
+    (asserts! (get active node-info) ERR_UNAUTHORIZED)
+    
+    ;; Verify node meets stake requirement
+    (asserts! (>= (get total-stake node-info) (get min-stake-requirement subnet)) ERR_INSUFFICIENT_STAKE)
+    
+    ;; Add node to subnet
+    (map-set SubnetMembership
+      {
+        subnet-id: subnet-id,
+        node: node
+      }
+      {
+        join-block: stacks-block-height,
+        stake-committed: (get total-stake node-info)
+      }
+    )
+    
+    ;; Update subnet node count
+    (map-set Subnets
+      { subnet-id: subnet-id }
+      (merge subnet { node-count: (+ (get node-count subnet) u1) })
+    )
+    
+    (ok true)
+  )
+)
+
+;; Get delegation info
+(define-read-only (get-delegation-info (delegator principal) (node principal))
+  (map-get? StakeDelegations { delegator: delegator, node: node })
+)
+
+;; Get node delegation stats
+(define-read-only (get-node-delegation-stats (node principal))
+  (map-get? NodeDelegationInfo { node-address: node })
+)
+
+;; Get proposal details
+(define-read-only (get-proposal (proposal-id uint))
+  (map-get? Proposals { proposal-id: proposal-id })
+)
+
+;; Get data feed details
+(define-read-only (get-data-feed (feed-id (string-ascii 32)))
+  (map-get? DataFeeds { feed-id: feed-id })
+)
+
+;; Get subnet details
+(define-read-only (get-subnet (subnet-id (string-ascii 32)))
+  (map-get? Subnets { subnet-id: subnet-id })
+)
+
+;; Check if node is member of subnet
+(define-read-only (is-subnet-member (subnet-id (string-ascii 32)) (node principal))
+  (is-some (map-get? SubnetMembership { subnet-id: subnet-id, node: node }))
+)
+
+;; Get reward period details
+(define-read-only (get-reward-period (period-id uint))
+  (map-get? RewardPeriods { period-id: period-id })
+)
